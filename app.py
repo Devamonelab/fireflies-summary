@@ -15,16 +15,18 @@ import psycopg2.extras
 import boto3
 from botocore.config import Config
 
-# NEW: load .env (local dev). In containers/EC2, you can inject env vars instead.
+# ──────────────────────────────────────────────────────────────────────────────
+# Load .env for local dev (never commit real secrets). In Docker/EC2, inject env.
+# ──────────────────────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # loads variables from .env into process env if present
+    load_dotenv(override=True)      # <— override any stale shell vars
 except Exception:
     pass
 
-# =========================
-# CONFIG via ENV VARS (no hard-coded secrets)
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG (Environment)
+# ──────────────────────────────────────────────────────────────────────────────
 DB_HOST = os.getenv("DB_HOST", "")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "")
@@ -32,9 +34,9 @@ DB_USER = os.getenv("DB_USER", "")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
-# NOTE: Prefer IAM roles in production. If keys are present in env, boto3 will use them automatically.
-AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
-AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")           # optional (prefer IAM role)
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")   # optional
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")           # optional (for temp creds)
 
 MODEL_ID = os.getenv("MODEL_ID", "meta.llama3-70b-instruct-v1:0")
 
@@ -49,6 +51,14 @@ SUMMARY_MAX_SENTENCES = int(os.getenv("SUMMARY_MAX_SENTENCES", "12"))
 PARA_MIN = int(os.getenv("PARA_MIN", "2"))
 PARA_MAX = int(os.getenv("PARA_MAX", "4"))
 
+# Treat [] as "missing" so they get reprocessed
+TREAT_EMPTY_LIST_AS_MISSING = os.getenv("TREAT_EMPTY_LIST_AS_MISSING", "true").strip().lower() in ("1","true","yes","on")
+
+# NEW: allow inferred next-steps when none are explicit
+ALLOW_INFERRED_ITEMS = os.getenv("ALLOW_INFERRED_ITEMS", "true").strip().lower() in ("1","true","yes","on")
+INFER_ITEMS_MIN = int(os.getenv("INFER_ITEMS_MIN", "1"))   # ensure at least N
+INFER_ITEMS_MAX = int(os.getenv("INFER_ITEMS_MAX", "3"))   # cap
+
 # Logging
 LOG_LEVEL_NAME = os.getenv("LOG_LEVEL", "DEBUG").upper()
 LOG_LEVEL = getattr(logging, LOG_LEVEL_NAME, logging.DEBUG)
@@ -56,9 +66,9 @@ LOG_DIR = os.getenv("LOG_DIR", "logs")
 LOG_FILE = os.getenv("LOG_FILE", os.path.join(LOG_DIR, "app.log"))
 LOG_PREVIEW_CHARS = int(os.getenv("LOG_PREVIEW_CHARS", "300"))
 
-# =========================
-# Logging setup
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────────────────────────────────────────
 def setup_logging() -> logging.Logger:
     os.makedirs(LOG_DIR, exist_ok=True)
     fmt = "%(asctime)s | %(levelname)s | %(threadName)s | %(funcName)s:%(lineno)d - %(message)s"
@@ -85,33 +95,50 @@ def setup_logging() -> logging.Logger:
 
 logger = setup_logging()
 
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 # Flask + Bedrock client
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-
-logger.info("Booting app | region=%s | table=%s", AWS_REGION, 'public."myApp_meetingtranscript"')
+logger.info(
+    'Booting | region=%s | table=%s | TREAT_EMPTY_LIST_AS_MISSING=%s | ALLOW_INFERRED_ITEMS=%s',
+    AWS_REGION, 'public."myApp_meetingtranscript"', TREAT_EMPTY_LIST_AS_MISSING, ALLOW_INFERRED_ITEMS
+)
 logger.info("DB host=%s db=%s user=%s", DB_HOST, DB_NAME, DB_USER)
 
-# Build Bedrock client. Let boto3 pick creds from env/instance role automatically.
+def assert_aws_auth():
+    try:
+        sess = boto3.Session(
+            aws_access_key_id=AWS_ACCESS_KEY_ID or None,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY or None,
+            aws_session_token=AWS_SESSION_TOKEN or None,
+            region_name=AWS_REGION,
+        )
+        who = sess.client("sts").get_caller_identity()
+        logger.info("AWS auth OK | account=%s | arn=%s", who.get("Account"), who.get("Arn"))
+    except Exception as e:
+        logger.error("AWS auth FAILED (bad/expired creds or wrong region). %s", e)
+        raise
+
+assert_aws_auth()
+
 bedrock_kwargs = {
     "region_name": AWS_REGION,
     "config": Config(retries={"max_attempts": 8, "mode": "adaptive"}),
 }
-# If you *must* use env keys locally, boto3 will read them automatically from env.
-# But we also allow explicit pass-through if set (optional).
 if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
     bedrock_kwargs.update({
         "aws_access_key_id": AWS_ACCESS_KEY_ID,
         "aws_secret_access_key": AWS_SECRET_ACCESS_KEY,
     })
+    if AWS_SESSION_TOKEN:
+        bedrock_kwargs["aws_session_token"] = AWS_SESSION_TOKEN
 
 bedrock = boto3.client("bedrock-runtime", **bedrock_kwargs)
 logger.debug("Bedrock client ready for model_id=%s", MODEL_ID)
 
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 # Utils
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 def preview(text: str, n: int = LOG_PREVIEW_CHARS) -> str:
     if text is None:
         return "<none>"
@@ -126,9 +153,9 @@ def count_paragraphs(md: str) -> int:
     paras = [p for p in re.split(r"\n\s*\n", md.strip()) if p.strip()]
     return len(paras)
 
-# =========================
-# DB helpers (unchanged except they use env-backed config)
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+# DB helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def db_conn():
     logger.debug("Opening DB connection …")
     conn = psycopg2.connect(
@@ -143,7 +170,7 @@ def db_conn():
     return conn
 
 def ensure_trigger():
-    """Create the NOTIFY function + trigger (idempotent)."""
+    """Create LISTEN/NOTIFY trigger (idempotent)."""
     sql = """
     CREATE OR REPLACE FUNCTION public.notify_new_transcript()
     RETURNS trigger AS $$
@@ -193,12 +220,12 @@ def fetch_row_by_id(row_id: int) -> Optional[Dict[str, Any]]:
 
 def fetch_missing(limit: int) -> List[Dict[str, Any]]:
     """
-    Any row with empty/NULL summary OR missing actionItem.
-    Missing actionItem includes:
+    Rows with empty/NULL summary OR missing actionItem.
+    Missing includes:
       - SQL NULL
       - JSONB null
-      - empty object {}
-    NOTE: We intentionally do NOT treat [] as missing (prevents infinite loops when a meeting truly has no tasks).
+      - {}
+      - [] (iff TREAT_EMPTY_LIST_AS_MISSING=True)
     """
     q = """
         SELECT id,
@@ -214,17 +241,18 @@ def fetch_missing(limit: int) -> List[Dict[str, Any]]:
                 "actionItem" IS NULL
              OR jsonb_typeof("actionItem") = 'null'
              OR "actionItem"::text = '{}'
+             OR (%s AND jsonb_typeof("actionItem") = 'array' AND jsonb_array_length("actionItem") = 0)
            )
         ORDER BY created_at DESC, id DESC
         LIMIT %s
     """
     try:
         with db_conn() as conn, conn.cursor() as cur:
-            cur.execute(q, (limit,))
+            cur.execute(q, (TREAT_EMPTY_LIST_AS_MISSING, limit))
             rows = cur.fetchall()
             logger.debug(
-                "fetch_missing(limit=%s) -> %s rows (treating NULL/json null/{} as missing, [] as filled)",
-                limit, len(rows)
+                "fetch_missing(limit=%s) -> %s rows (empty-list-missing=%s)",
+                limit, len(rows), TREAT_EMPTY_LIST_AS_MISSING
             )
             if rows:
                 logger.debug("missing ids=%s", [r["id"] for r in rows])
@@ -256,11 +284,9 @@ def update_row_partial(row_id: int, summary: Optional[str] = None, action_items:
     except Exception:
         logger.exception("DB error updating row_id=%s", row_id)
 
-# =========================
-# LLM prompts — Narrative (2–4 paragraphs, 3–12 sentences), precise AIs
-# Action items must be [{"item":"...","owner":"...","deadline":"..."}]
-# Owner/deadline blank "" if unknown.
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM prompts
+# ──────────────────────────────────────────────────────────────────────────────
 SYSTEM_MSG = (
     "You are a meticulous meeting analyst. Use only information present in the transcript. "
     "Write in neutral, professional tone. Do not invent names, dates, times, owners, or tasks. "
@@ -278,18 +304,12 @@ def mk_prompt_chunk(transcript_chunk: str) -> Dict[str, Any]:
         "{\n"
         '  "summary_md": string,  // multi-paragraph narrative with '
         f'{PARA_MIN}-{PARA_MAX} paragraphs and {SUMMARY_MIN_SENTENCES}-{SUMMARY_MAX_SENTENCES} total sentences; '
-        "NO headings, NO bullet lists. Be chronological; cover context/purpose, key points, decisions, risks, next steps—ONLY if present.\n"
+        "NO headings, NO bullet lists; chronological; only facts present.\n"
         '  "action_items": [\n'
-        "    {\n"
-        '      "item": string,          // verb-first, precise, ≤ 25 words\n'
-        '      "owner": string,         // if owner not explicit, set ""\n'
-        '      "deadline": string       // date e.g. 2/15/2023; if not explicit, set ""\n'
-        "    }\n"
+        '    {"item": string, "owner": string, "deadline": string}\n'
         "  ]\n"
         "}\n"
-        f"- summary_md MUST be plain Markdown prose, {PARA_MIN}-{PARA_MAX} paragraphs, {SUMMARY_MIN_SENTENCES}-{SUMMARY_MAX_SENTENCES} sentences total.\n"
-        "- Include ALL clear action items; omit vague ideas. Do NOT add extra fields to items.\n"
-        '- Owner and deadline MUST be strings; use "" when unknown.\n'
+        "- Include ONLY clear action items; omit vague ideas. Use \"\" for unknown owner/deadline.\n"
         "Transcript chunk:\n"
         f"{transcript_chunk}\n"
         "<|eot_id|>"
@@ -308,13 +328,10 @@ def mk_prompt_merge(summaries: List[str], items: List[Dict[str, Any]]) -> Dict[s
         "<|start_header_id|>user<|end_header_id|>\n"
         "Merge the CHUNK outputs below into ONE final result. Return STRICT JSON:\n"
         "{\n"
-        '  "summary_md": string,  // multi-paragraph narrative with '
-        f'{PARA_MIN}-{PARA_MAX} paragraphs and {SUMMARY_MIN_SENTENCES}-{SUMMARY_MAX_SENTENCES} sentences total; '
-        "no headings/bullets; chronological; detailed but only facts present.\n"
+        '  "summary_md": string,\n'
         '  "action_items": [ { "item":string, "owner":string, "deadline":string } ]\n'
         "}\n"
-        "- Deduplicate near-duplicates in action_items.\n"
-        '- Ensure each item has all three keys; use "" for unknown owner/deadline.\n\n'
+        "- Deduplicate near-duplicates; keep only precise tasks.\n\n"
         "Chunk summaries to merge:\n"
         f"{summaries_join}\n\n"
         "All action items from chunks:\n"
@@ -332,17 +349,37 @@ def mk_prompt_rewrite(summary_md: str) -> Dict[str, Any]:
         "<|eot_id|>"
         "<|start_header_id|>user<|end_header_id|>\n"
         f"Rewrite the following to be {PARA_MIN}-{PARA_MAX} paragraphs and "
-        f"{SUMMARY_MIN_SENTENCES}-{SUMMARY_MAX_SENTENCES} sentences total, chronological, and without headings/bullets. "
-        "Keep facts unchanged.\n\n"
+        f"{SUMMARY_MIN_SENTENCES}-{SUMMARY_MAX_SENTENCES} sentences total, chronological, no headings/bullets.\n\n"
         f"{summary_md}\n"
         "<|eot_id|>"
         "<|start_header_id|>assistant<|end_header_id|>\n"
     )
     return {"prompt": chat, "max_gen_len": 700, "temperature": 0.2, "top_p": 0.9, "stop": ["<|eot_id|>"]}
 
-# =========================
-# Bedrock helpers
-# =========================
+# NEW: infer items even when none are explicit
+def mk_prompt_infer_actions(transcript_text: str, summary_text: str = "") -> Dict[str, Any]:
+    context = summary_text.strip() or transcript_text
+    chat = (
+        "<|begin_of_text|>"
+        "<|start_header_id|>system<|end_header_id|>\n"
+        "You are a practical project assistant. When a transcript lacks explicit tasks, "
+        "infer 1–3 reasonable next steps based on context. Do NOT invent names or dates; "
+        "use empty strings for unknown owner/deadline.\n"
+        "<|eot_id|>"
+        "<|start_header_id|>user<|end_header_id|>\n"
+        "From the CONTEXT below, return STRICT JSON:\n"
+        "{\n"
+        '  "action_items": [ {"item": string, "owner": "", "deadline": ""} ]\n'
+        "}\n"
+        f"Context:\n{context}\n"
+        "<|eot_id|>"
+        "<|start_header_id|>assistant<|end_header_id|>\n"
+    )
+    return {"prompt": chat, "max_gen_len": 500, "temperature": 0.3, "top_p": 0.9, "stop": ["<|eot_id|>"]}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bedrock call
+# ──────────────────────────────────────────────────────────────────────────────
 def bedrock_invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
     t0 = time.perf_counter()
     try:
@@ -363,8 +400,7 @@ def bedrock_invoke(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def parse_generation_json(generation_text: str) -> Dict[str, Any]:
     try:
-        obj = json.loads(generation_text)
-        return obj
+        return json.loads(generation_text)
     except Exception:
         m = re.search(r"\{.*\}", generation_text, re.DOTALL)
         if m:
@@ -375,9 +411,9 @@ def parse_generation_json(generation_text: str) -> Dict[str, Any]:
     logger.warning("parse_generation_json: returning empty structure. Preview=%s", preview(generation_text))
     return {"summary_md": "", "action_items": []}
 
-# =========================
-# Transcript -> summary/action
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+# Transcript → summary/action
+# ──────────────────────────────────────────────────────────────────────────────
 def flatten_transcription(transcription: Any) -> str:
     """Turns JSONB transcript into sequential text with speakers if present."""
     if transcription is None:
@@ -387,7 +423,7 @@ def flatten_transcription(transcription: Any) -> str:
         try:
             transcription = json.loads(transcription)
         except Exception:
-            logger.debug("flatten_transcription: string not JSON; using raw text preview=%s", preview(transcription))
+            logger.debug("flatten_transcription: raw string used. preview=%s", preview(transcription))
             return transcription
 
     lines: List[str] = []
@@ -409,10 +445,7 @@ def flatten_transcription(transcription: Any) -> str:
     return dumped
 
 def normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Keep precise, verb-first items; map blanks to ""; de-dup by normalized text.
-    Target schema: [{"item": "...", "owner": "...", "deadline": "..."}]
-    """
+    """Return [{"item","owner","deadline"}] with dedupe + blanks normalized."""
     out, seen = [], set()
     for it in items or []:
         if not isinstance(it, dict):
@@ -436,35 +469,26 @@ def normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 def summarize_transcript(text: str) -> Dict[str, Any]:
-    """Main summarization flow with chunking, merge, and paragraph/sentence enforcement."""
+    """Summarization with chunk/merge + bounds + fallback inference."""
     if not text.strip():
-        logger.info("summarize_transcript: empty transcript text.")
+        logger.info("summarize_transcript: empty transcript.")
         return {"summary_md": "", "action_items": []}
 
     logger.debug("summarize_transcript: total chars=%s", len(text))
 
-    # Single-shot if small
     if len(text) <= CHUNK_CHAR_LIMIT:
-        logger.debug("Single-shot summarization path.")
         data = bedrock_invoke(mk_prompt_chunk(text))
         obj = parse_generation_json(data.get("generation", ""))
     else:
-        # Chunked + merge
         chunks = [text[i:i+CHUNK_CHAR_LIMIT] for i in range(0, len(text), CHUNK_CHAR_LIMIT)]
-        logger.debug("Chunked summarization: %s chunks of up to %s chars.", len(chunks), CHUNK_CHAR_LIMIT)
-
         chunk_summaries, chunk_items = [], []
-        for idx, ch in enumerate(chunks, start=1):
-            logger.debug("Processing chunk %s/%s (chars=%s)", idx, len(chunks), len(ch))
+        for ch in chunks:
             data = bedrock_invoke(mk_prompt_chunk(ch))
             co = parse_generation_json(data.get("generation", ""))
             if co.get("summary_md"):
-                logger.debug("Chunk %s summary preview=%s", idx, preview(co["summary_md"]))
                 chunk_summaries.append(co["summary_md"])
             if isinstance(co.get("action_items"), list):
-                logger.debug("Chunk %s action_items=%s", idx, len(co["action_items"]))
                 chunk_items.extend(co["action_items"])
-
         data = bedrock_invoke(mk_prompt_merge(chunk_summaries, chunk_items))
         obj = parse_generation_json(data.get("generation", ""))
 
@@ -473,43 +497,45 @@ def summarize_transcript(text: str) -> Dict[str, Any]:
     n_sent = count_sentences(summary)
     n_para = count_paragraphs(summary)
     if (n_sent < SUMMARY_MIN_SENTENCES or n_sent > SUMMARY_MAX_SENTENCES) or (n_para < PARA_MIN or n_para > PARA_MAX):
-        logger.info("Rewriting summary to meet bounds (sent=%s, para=%s).", n_sent, n_para)
         data2 = bedrock_invoke(mk_prompt_rewrite(summary))
         summary2 = (data2.get("generation") or "").strip()
         if summary2:
             summary = summary2
-            logger.debug("Rewrite preview=%s", preview(summary))
-        else:
-            logger.warning("Rewrite returned empty; keeping original.")
 
-    # Normalize precise items & dedupe to target schema
+    # Normalize items from main pass
     items = normalize_items(obj.get("action_items", []))
-    logger.debug("Final summary len=%s, action_items=%s", len(summary), len(items))
+
+    # Fallback: infer 1–3 items when none are explicit
+    if ALLOW_INFERRED_ITEMS and len(items) < INFER_ITEMS_MIN:
+        logger.info("No explicit items; invoking inferred-items fallback…")
+        d = bedrock_invoke(mk_prompt_infer_actions(text, summary))
+        obj2 = parse_generation_json(d.get("generation", ""))
+        inferred = obj2.get("action_items") or obj2.get("items") or obj2.get("tasks") or []
+        items = normalize_items(inferred)
+        if INFER_ITEMS_MAX > 0:
+            items = items[:INFER_ITEMS_MAX]
+        logger.debug("Inferred %s action items.", len(items))
+
     return {"summary_md": summary, "action_items": items}
 
-# =========================
-# Missing checks & row processing
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
+# Processing
+# ──────────────────────────────────────────────────────────────────────────────
 def is_items_missing(js: Any) -> bool:
-    """
-    Treat actionItem as missing when it is:
-      - SQL NULL
-      - JSONB null
-      - empty object {}
-    Treat [] as 'filled' (meeting had no actionable tasks).
-    """
+    """Missing when NULL / json null / {} / [] (if configured)."""
     if js is None:
         return True
     try:
         obj = json.loads(js) if isinstance(js, str) else js
     except Exception:
-        # Unknown string -> treat as filled to avoid loops.
-        return False
+        return False  # unknown text -> treat as filled
     if obj is None:
         return True
     if isinstance(obj, dict) and len(obj) == 0:
         return True
-    return False  # list [] or non-empty structures are considered filled
+    if TREAT_EMPTY_LIST_AS_MISSING and isinstance(obj, list) and len(obj) == 0:
+        return True
+    return False
 
 def needs_processing(row: Dict[str, Any]) -> Tuple[bool, bool]:
     need_summary = (row.get("summary") is None) or (str(row.get("summary")).strip() == "")
@@ -531,24 +557,18 @@ def process_row(row_id: int):
             return
 
         transcript_txt = flatten_transcription(row.get("transcription"))
-        logger.debug("Row %s transcript chars=%s preview=%s",
-                     row_id, len(transcript_txt), preview(transcript_txt))
-
         result = summarize_transcript(transcript_txt)
 
         summary_to_write = result["summary_md"] if need_summary else None
         items_to_write   = result["action_items"] if need_items else None
 
-        if need_items and isinstance(items_to_write, list) and len(items_to_write) == 0:
-            logger.info("Row %s: no explicit action items found; saving empty list once and marking complete.", row_id)
-
         update_row_partial(row_id, summary=summary_to_write, action_items=items_to_write)
     except Exception:
         logger.exception("process_row failed for id=%s", row_id)
 
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 # Background workers
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 def pg_listener():
     """Instant processing on INSERT via LISTEN/NOTIFY."""
     while True:
@@ -566,25 +586,25 @@ def pg_listener():
                 conn.poll()
                 while conn.notifies:
                     note = conn.notifies.pop(0)
-                    logger.info("NOTIFY received payload=%s", note.payload)
+                    logger.info("NOTIFY payload=%s", note.payload)
                     try:
                         row_id = int(note.payload)
                         process_row(row_id)
                     except Exception:
-                        logger.exception("Listener could not parse/process payload=%s", note.payload)
+                        logger.exception("Listener parse/process error for payload=%s", note.payload)
         except Exception:
             logger.exception("pg_listener crashed; restarting in 3s")
             time.sleep(3)
 
 def missing_scanner():
     """Continuously ensure ALL rows missing either field are filled."""
-    # Initial sweep at startup
+    # startup sweep
     rows = fetch_missing(BACKFILL_LIMIT)
     logger.info("Startup backfill: %s rows with missing fields", len(rows))
     for r in rows:
         process_row(r["id"])
 
-    # Continuous scan
+    # continuous
     while True:
         try:
             rows = fetch_missing(BACKFILL_LIMIT)
@@ -605,9 +625,9 @@ def start_workers():
 
 start_workers()
 
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 # Routes
-# =========================
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": datetime.utcnow().isoformat()}
